@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<title>Spike — AudioWorklet pitch proof</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: #9FC5D7; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif; color: #35291F;
+    -webkit-font-smoothing: antialiased; padding: 20px 16px 60px; line-height: 1.5;
+  }
+  .wrap { max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 800; letter-spacing: -0.01em; margin: 0 0 2px; }
+  .sub { font-family: ui-monospace, 'Space Mono', monospace; font-size: 11px; color: #574A3E; margin-bottom: 16px; }
+  .card { background: #F4F1E8; border: 1px solid #CFC8B8; border-radius: 16px; padding: 16px 16px 18px; margin-bottom: 12px; }
+  .step { font-family: ui-monospace, monospace; font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; color: #7A6E60; margin-bottom: 8px; }
+  h2 { font-size: 16px; font-weight: 700; margin: 0 0 6px; }
+  p { margin: 0 0 12px; font-size: 13.5px; color: #574A3E; }
+  .mono { font-family: ui-monospace, 'Space Mono', monospace; }
+  button {
+    font-family: inherit; font-size: 15px; font-weight: 700; color: #F4F1E8;
+    background: #C0362B; border: none; border-radius: 13px; padding: 15px 18px;
+    width: 100%; min-height: 52px; cursor: pointer; touch-action: manipulation;
+  }
+  button:active { background: #A82F25; }
+  button.ghost { background: #EDE8DA; color: #574A3E; border: 1px solid #C2BAA8; }
+  button.ghost:active { background: #E0D8C6; }
+  button[disabled] { opacity: .4; }
+  .meter { height: 12px; background: #DCE8EE; border-radius: 6px; overflow: hidden; margin: 4px 0 10px; }
+  .meter > i { display: block; height: 100%; width: 0; background: #5E8F73; transition: width .06s linear; }
+  .live { font-family: ui-monospace, monospace; font-size: 13px; color: #35291F; }
+  .big { font-size: 30px; font-weight: 800; font-family: ui-monospace, monospace; }
+  .rows { font-family: ui-monospace, monospace; font-size: 12px; color: #35291F; }
+  .rows div { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid #E4DECF; }
+  .rows div:last-child { border-bottom: none; }
+  .rows .k { color: #7A6E60; }
+  .good { color: #4F7E63; } .bad { color: #C0362B; } .warn { color: #8A5A1E; }
+  .hint { font-size: 12px; color: #7A6E60; }
+  .timer { font-family: ui-monospace, monospace; font-size: 13px; color: #8A5A1E; font-weight: 700; }
+  pre.out { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace; font-size: 11.5px; background: #EDE8DA; border: 1px solid #D6D0C2; border-radius: 10px; padding: 12px; color: #35291F; }
+  .center { text-align: center; }
+  .flag { background: #F3DCD7; border: 1px solid #E0B3AC; border-radius: 10px; padding: 10px 12px; font-size: 12px; color: #8A2018; margin-top: 8px; }
+  table.cmp { width: 100%; border-collapse: collapse; font-family: ui-monospace, monospace; font-size: 12px; margin-top: 6px; }
+  table.cmp th, table.cmp td { text-align: right; padding: 6px 6px; border-bottom: 1px solid #E4DECF; }
+  table.cmp th:first-child, table.cmp td:first-child { text-align: left; color: #7A6E60; }
+  table.cmp th { color: #574A3E; font-weight: 700; }
+  canvas { display:block; width:100%; height:130px; background:#DCE8EE; border-radius:12px; margin:8px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AudioWorklet pitch — spike</h1>
+  <div class="sub">bet #1 · returns 5 numbers · ~20 min hands-on · read them back to CC</div>
+  <div id="app"></div>
+</div>
+
+<!-- The pitch-detection AudioWorklet processor. Read as text, Blob'd, addModule'd —
+     keeps this rig a single self-contained file. Net-new: this is the <30ms path
+     the repo's 130ms main-thread poll (media/pitch.ts) is meant to replace. -->
+<script id="worklet-src" type="text/worklet">
+const MIN_HZ = 60, MAX_HZ = 1100, CONFIDENCE = 0.25;
+const WINDOW = 2048;   // detection window (samples)
+const HOP = 512;       // run detection every HOP samples (~11.6ms @44.1k)
+const hasPerf = (typeof performance !== 'undefined' && performance.now);
+
+class PitchProc extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.ring = new Float32Array(WINDOW);
+    this.w = 0; this.filled = 0; this.total = 0;
+  }
+  process(inputs) {
+    const inp = inputs[0];
+    if (!inp || !inp[0]) return true;
+    const ch = inp[0];
+    const blockStart = currentTime;
+    for (let i = 0; i < ch.length; i++) {
+      this.ring[this.w] = ch[i];
+      this.w = (this.w + 1) % WINDOW;
+      this.filled++; this.total++;
+    }
+    if (this.filled >= HOP && this.total >= WINDOW) {
+      this.filled = 0;
+      const lin = new Float32Array(WINDOW);
+      for (let i = 0; i < WINDOW; i++) lin[i] = this.ring[(this.w + i) % WINDOW];
+      const t0 = hasPerf ? performance.now() : 0;
+      const r = analyze(lin, sampleRate);
+      const procMs = hasPerf ? performance.now() - t0 : -1;
+      this.port.postMessage({ ...r, procMs, t: blockStart });
+    }
+    return true;
+  }
+}
+registerProcessor('pitch-proc', PitchProc);
+</script>
+
+<script id="analyze-src" type="text/plain">
+// ── autocorrelation, ported from media/pitch.ts (mean-normalized, first-peak≥85%) ──
+// Shared verbatim by the worklet (audio thread) and the shipped-path sim (main thread),
+// so the two columns time the SAME work.
+function analyze(buf, sr) {
+  const MIN_HZ = 60, MAX_HZ = 1100, CONFIDENCE = 0.25;
+  const n = buf.length;
+  let energy = 0, peak = 0, zc = 0, prev = 0;
+  for (let i = 0; i < n; i++) {
+    const s = buf[i];
+    energy += s * s;
+    const a = s < 0 ? -s : s; if (a > peak) peak = a;
+    if ((s >= 0) !== (prev >= 0)) zc++; prev = s;
+  }
+  const rms = Math.sqrt(energy / n);
+  const meanEnergy = energy / n;
+  const maxLag = Math.floor(sr / MIN_HZ), minLag = Math.floor(sr / MAX_HZ);
+  let best = 0;
+  const corr = new Float32Array(maxLag - minLag + 1);
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let sum = 0, count = 0;
+    for (let i = 0; i < n - lag; i += 2) { sum += buf[i] * buf[i + lag]; count++; }
+    const mean = count > 0 ? sum / count : 0;
+    corr[lag - minLag] = mean;
+    if (mean > best) best = mean;
+  }
+  const clarity = meanEnergy > 0 ? (best * 2) / meanEnergy : 0;
+  let hz = -1;
+  if (rms >= 0.0005 && clarity >= CONFIDENCE) {
+    const floor = best * 0.85;
+    for (let k = 1; k < corr.length - 1; k++) {
+      const c = corr[k];
+      if (c >= floor && c > corr[k - 1] && c >= corr[k + 1]) { hz = sr / (minLag + k); break; }
+    }
+  }
+  let peaksOverHalf = 0; const thr = best * 0.6;
+  for (let k = 1; k < corr.length - 1; k++)
+    if (corr[k] >= thr && corr[k] > corr[k-1] && corr[k] >= corr[k+1]) peaksOverHalf++;
+  return { hz, rms, clarity, crest: rms > 0 ? peak / rms : 0, zcr: zc / n, peaks: peaksOverHalf };
+}
+</script>
+
+<script>
+// ───────────────────────── main thread: stations + aggregation ─────────────────────────
+const A440 = 440;
+const HOP = 512, POLL_MS = 130;   // POLL_MS = the shipped media/pitch.ts cadence
+const hzToMidiFloat = (hz) => 69 + 12 * Math.log2(hz / A440);
+const NOTE = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const noteName = (midi) => NOTE[((Math.round(midi)%12)+12)%12] + (Math.floor(Math.round(midi)/12)-1);
+const median = (a) => { if(!a.length) return NaN; const s=[...a].sort((x,y)=>x-y); const m=s.length>>1; return s.length%2?s[m]:(s[m-1]+s[m])/2; };
+const pct = (a,p) => { if(!a.length) return NaN; const s=[...a].sort((x,y)=>x-y); return s[Math.min(s.length-1, Math.floor(p/100*s.length))]; };
+const fx = (n,d=1) => (n==null||Number.isNaN(n))?'—':n.toFixed(d);
+// bring analyze() into main-thread scope for the shipped-path column
+eval(document.getElementById('analyze-src').textContent);
+
+const app = document.getElementById('app');
+let ctx, micStream, node, analyser, anaBuf;
+let onMsg = null;
+const allFrames = [];
+let micError = null;
+
+const RESULT = {
+  device: '', sampleRate: 0, baseLatencyMs: null, outputLatencyMs: null,
+  loopbackMs: [], loopbackMedian: null, loopbackMeasured: false,
+  lowE: null, bStr: null,
+  // two-column frame budget
+  shipped: { detectWorst: null, rafWorst: null, rafP95: null },
+  worklet: { procWorst: null, procMedian: null, rafWorst: null, rafP95: null, perfAvail: false },
+  pluck: null, strum: null, separability: '',
+  touch: null,
+  rmsResolved: [], rmsUnresolved: [],
+};
+
+function h(html){ const d=document.createElement('div'); d.innerHTML=html.trim(); return d.firstChild; }
+function screen(node){ app.innerHTML=''; app.appendChild(node); }
+const sleep = (ms) => new Promise(r=>setTimeout(r,ms));
+
+async function startAudio() {
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === 'suspended') await ctx.resume();
+  RESULT.sampleRate = ctx.sampleRate;
+  RESULT.baseLatencyMs = ctx.baseLatency != null ? ctx.baseLatency*1000 : null;
+  RESULT.outputLatencyMs = ctx.outputLatency != null ? ctx.outputLatency*1000 : null;
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation:false, noiseSuppression:false, autoGainControl:false },
+  });
+  const src = ctx.createMediaStreamSource(micStream);
+  // worklet path (audio thread)
+  const blob = new Blob([
+    document.getElementById('analyze-src').textContent + '\n' +
+    document.getElementById('worklet-src').textContent
+  ], { type:'application/javascript' });
+  await ctx.audioWorklet.addModule(URL.createObjectURL(blob));
+  node = new AudioWorkletNode(ctx, 'pitch-proc');
+  node.port.onmessage = (e) => {
+    allFrames.push(e.data);
+    if (e.data.procMs >= 0) RESULT.worklet.perfAvail = true;
+    if (onMsg) onMsg(e.data);
+  };
+  src.connect(node);
+  const zero = ctx.createGain(); zero.gain.value = 0;
+  node.connect(zero); zero.connect(ctx.destination);
+  // shipped-path tap (main thread): AnalyserNode read on a 130ms setInterval
+  analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
+  src.connect(analyser);
+  anaBuf = new Float32Array(analyser.fftSize);
+  RESULT.device = navigator.userAgent;
+}
+
+function tapRms(f){ if (f.hz > 0) RESULT.rmsResolved.push(f.rms); else if (f.rms > 0.00001) RESULT.rmsUnresolved.push(f.rms); }
+
+// ════════════════════ STATION 0 ════════════════════
+function s0() {
+  screen(h(`<div>
+    <div class="card">
+      <div class="step">Station 0 · setup</div>
+      <h2>Start the mic</h2>
+      <p>Quiet-ish room, guitar in standard tuning. Tap below and <b>allow the microphone</b>. Run it on the <b>real phone</b>, in the browser you actually use (Safari/iOS is the harder case — prefer it).</p>
+      <button id="go">Tap to start · allow mic</button>
+      <div id="err"></div>
+    </div>
+    <div class="card"><div class="hint">Collects five numbers: (1) acoustic round-trip latency, (2) low-E &amp; B accuracy, (3) shipped-vs-worklet frame budget, (4) pluck-vs-strum separability, (5) resolved-vs-unresolved RMS. Read the final block back to Claude Code.</div></div>
+  </div>`));
+  document.getElementById('go').onclick = async () => {
+    try { await startAudio(); s1(); }
+    catch (e) {
+      micError = String(e && e.name || e);
+      document.getElementById('err').innerHTML =
+        `<div class="flag">Mic did not start: <b>${micError}</b>. ${/NotAllowed|Permission/i.test(micError)?'Permission denied — reload and allow it (a denied mic is a first-class state the app must handle).':'Try another browser, or check mic permission for this site.'}</div>`;
+    }
+  };
+}
+
+// ════════════════════ STATION 1 — acoustic round-trip latency ════════════════════
+function s1() {
+  screen(h(`<div class="card">
+    <div class="step">Station 1 · latency (acoustic)</div>
+    <h2>Round-trip: speaker → air → mic</h2>
+    <p>The only latency number that counts is the acoustic one. This plays 8 clicks through the <b>speaker</b> and hears each back through the <b>mic</b>, Δ on the audio clock. <b>Turn the volume up.</b> Hold the phone normally; don't cover the mic.</p>
+    <div class="hint" style="margin-bottom:10px">Browser self-report (context only, <b>not the answer</b>): base ${fx(RESULT.baseLatencyMs,1)}ms · output ${fx(RESULT.outputLatencyMs,1)}ms · ${RESULT.sampleRate}Hz</div>
+    <div class="meter"><i id="lmtr"></i></div>
+    <div class="live" id="llive">mic peak — · you should HEAR each beep; if you don't, the mic won't either</div>
+    <button id="run">Play 8 beeps &amp; measure</button>
+    <div id="prog" class="timer" style="margin-top:10px"></div>
+    <div id="ldone"></div>
+  </div>`));
+  document.getElementById('run').onclick = runLoopback;
+}
+async function runLoopback() {
+  const prog = document.getElementById('prog');
+  RESULT.loopbackMs = [];
+  const N = 8;
+  for (let i = 0; i < N; i++) {
+    prog.textContent = `beep ${i+1} / ${N} …`;
+    const dt = await oneClick((rms, peak) => {
+      const m = document.getElementById('lmtr'); if (m) m.style.width = Math.min(100, rms*500) + '%';
+      const lv = document.getElementById('llive'); if (lv) lv.textContent = `mic peak ${peak.toFixed(3)}`;
+    });
+    if (dt != null) RESULT.loopbackMs.push(dt);
+    await sleep(500);
+  }
+  prog.textContent = '';
+  RESULT.loopbackMeasured = RESULT.loopbackMs.length >= 3;   // need a few real catches to call it measured
+  RESULT.loopbackMedian = RESULT.loopbackMeasured ? median(RESULT.loopbackMs) : null;
+  const rows = RESULT.loopbackMs.map((m,i)=>`<div><span class="k">click ${i+1}</span><span class="mono">${fx(m,1)} ms</span></div>`).join('');
+  let head;
+  if (!RESULT.loopbackMeasured) {
+    head = `<div class="flag"><b>NOT MEASURED</b> — the mic caught only ${RESULT.loopbackMs.length}/8 beeps. Round-trip latency is unanswered (the browser self-report is NOT a substitute). If you're on iPhone, iOS routes audio to the quiet earpiece while the mic is open — so the speaker loopback can't work here. That's fine: <b>tap “Next” and skip it</b> — the other four numbers don't use the speaker. (To get latency later: run this on Android/Chrome, or point an external speaker at the phone.)</div>`;
+  } else {
+    const spread = Math.max(...RESULT.loopbackMs) - Math.min(...RESULT.loopbackMs);
+    const cls = RESULT.loopbackMedian<80?'good':RESULT.loopbackMedian<160?'warn':'bad';
+    head = `<div class="big ${cls}" style="margin-top:10px">${fx(RESULT.loopbackMedian,1)} ms<span style="font-size:13px;color:#7A6E60"> acoustic round-trip · ${RESULT.loopbackMs.length}/8</span></div>
+      <div class="hint">Jitter across the 8 = ${fx(spread,1)}ms. A constant offset calibrates out; jitter does not — that spread is what limits timing, not the median.</div>`;
+  }
+  document.getElementById('ldone').innerHTML =
+    `<div class="rows" style="margin-top:12px">${rows||'<div class="bad">no clicks detected</div>'}</div>${head}
+     <button id="retry" class="ghost" style="margin-top:12px">Retry latency</button>
+     <button id="next" style="margin-top:8px">Next · low E accuracy</button>`;
+  document.getElementById('retry').onclick = runLoopback;
+  document.getElementById('next').onclick = () => s2('lowE');
+}
+function oneClick(onLevel) {
+  return new Promise((resolve) => {
+    const sr = ctx.sampleRate, emitAt = ctx.currentTime + 0.15;
+    // A 6ms noise transient was inaudible on phone speakers. A loud, sustained
+    // 2kHz tone burst (~60ms) is far louder-perceived, sits in the speaker's
+    // efficient band and the mic's sensitive band, and gives a clean RMS spike.
+    const dur = 0.06;
+    const buf = ctx.createBuffer(1, Math.floor(sr*dur), sr);
+    const d = buf.getChannelData(0);
+    for (let i=0;i<d.length;i++){
+      const t = i/sr;
+      const env = Math.min(1, t/0.003) * Math.min(1, (dur-t)/0.01); // 3ms attack, 10ms release
+      d[i] = Math.sin(2*Math.PI*2000*t) * env * 0.98;
+    }
+    const s = ctx.createBufferSource(); s.buffer = buf;
+    s.connect(ctx.destination); s.start(emitAt);
+    let baseline = 0.01, done = false, peak = 0;
+    const handler = (f) => {
+      if (done) return;
+      if (f.rms > peak) peak = f.rms;
+      if (onLevel) onLevel(f.rms, peak);
+      if (f.t < emitAt) { baseline = baseline*0.9 + f.rms*0.1; return; }  // learn the room
+      if (f.rms > Math.max(0.025, baseline*3)) { done = true; onMsg = tapRms; resolve((f.t - emitAt) * 1000); return; }
+      if (f.t - emitAt > 0.45) { done = true; onMsg = tapRms; resolve(null); }
+    };
+    onMsg = (f) => { tapRms(f); handler(f); };
+  });
+}
+
+// ════════════════════ STATION 2/3 — string accuracy ════════════════════
+const STRINGS = {
+  lowE: { name:'low E (6th string)', midi:40, hz:82.41, next:'B' },
+  B:    { name:'B (2nd string)',     midi:59, hz:246.94, next:'done' },
+};
+function s2(which) {
+  const S = STRINGS[which];
+  screen(h(`<div class="card">
+    <div class="step">Station ${which==='lowE'?2:3} · accuracy</div>
+    <h2>${S.name}</h2>
+    <p>Play <b>${S.name}</b> — target <span class="mono">${S.hz} Hz (${noteName(S.midi)})</span> — repeatedly for 15 seconds, letting each ring. The two strings that fail; every bad frame is kept.</p>
+    <div class="meter"><i id="mtr"></i></div>
+    <div class="live" id="live">detected: —</div>
+    <button id="run" style="margin-top:12px">Record 15s of ${which==='lowE'?'low E':'B'}</button>
+    <div id="sdone"></div>
+  </div>`));
+  document.getElementById('run').onclick = () => recordString(which);
+}
+async function recordString(which) {
+  const S = STRINGS[which];
+  const frames = [];
+  const btn = document.getElementById('run'); btn.disabled = true;
+  const live = document.getElementById('live'), mtr = document.getElementById('mtr');
+  onMsg = (f) => {
+    tapRms(f); frames.push(f);
+    mtr.style.width = Math.min(100, f.rms*400) + '%';
+    if (f.hz>0) live.innerHTML = `detected: <b>${fx(f.hz,1)} Hz</b> · ${noteName(hzToMidiFloat(f.hz))}`;
+  };
+  for (let t=15;t>0;t--){ btn.textContent = `listening… ${t}s`; await sleep(1000); }
+  onMsg = tapRms; btn.disabled=false; btn.textContent='done';
+  const resolved = frames.filter(f=>f.hz>0);
+  const rate = frames.length? resolved.length/frames.length : 0;
+  const onTarget=[], octaveUp=[], octaveDown=[], other=[], centsErr=[];
+  for (const f of resolved) {
+    const dSemi = hzToMidiFloat(f.hz) - S.midi;
+    if (Math.abs(dSemi) < 0.5) { onTarget.push(f); centsErr.push(dSemi*100); }
+    else if (Math.abs(dSemi-12) < 0.5) octaveUp.push(f);
+    else if (Math.abs(dSemi+12) < 0.5) octaveDown.push(f);
+    else other.push(f);
+  }
+  const res = {
+    frames: frames.length, resolvedRate: rate,
+    onTargetPct: resolved.length? onTarget.length/resolved.length : 0,
+    octaveUpPct: resolved.length? octaveUp.length/resolved.length : 0,
+    octaveDownPct: resolved.length? octaveDown.length/resolved.length : 0,
+    otherPct: resolved.length? other.length/resolved.length : 0,
+    centsMedian: median(centsErr.map(Math.abs)), centsP95: pct(centsErr.map(Math.abs),95),
+  };
+  if (which==='lowE') RESULT.lowE = res; else RESULT.bStr = res;
+  const octPct = res.octaveUpPct + res.octaveDownPct;
+  const rateCls = rate>0.7?'good':rate>0.4?'warn':'bad';
+  const octCls = octPct<0.05?'good':octPct<0.2?'warn':'bad';
+  document.getElementById('sdone').innerHTML = `
+    <div class="rows" style="margin-top:12px">
+      <div><span class="k">frames heard (resolved)</span><span class="mono ${rateCls}">${(rate*100).toFixed(0)}%</span></div>
+      <div><span class="k">on target (±50¢)</span><span class="mono">${(res.onTargetPct*100).toFixed(0)}%</span></div>
+      <div><span class="k">octave error</span><span class="mono ${octCls}">${(octPct*100).toFixed(0)}%</span></div>
+      <div><span class="k">other wrong note</span><span class="mono">${(res.otherPct*100).toFixed(0)}%</span></div>
+      <div><span class="k">cents err (median / p95)</span><span class="mono">${fx(res.centsMedian,0)}¢ / ${fx(res.centsP95,0)}¢</span></div>
+    </div>
+    <div class="hint">Octave error is the classic low-string autocorrelation failure; the p95 is the bad case, not averaged away.</div>
+    <button id="next" style="margin-top:12px">Next · ${S.next==='B'?'B string':'pluck vs strum'}</button>`;
+  document.getElementById('next').onclick = () => S.next==='B' ? s2('B') : s4();
+}
+
+// ════════════════════ STATION 4 — pluck vs strum ════════════════════
+function s4() {
+  screen(h(`<div class="card">
+    <div class="step">Station 4 · pluck vs strum</div>
+    <h2>Are they distinguishable?</h2>
+    <p>Two 12-second takes. First <b>pluck single strings</b> one at a time; then <b>strum all six</b> together, repeatedly. We compare autocorrelation clarity — no FFT.</p>
+    <div class="meter"><i id="mtr"></i></div>
+    <div class="live" id="live">—</div>
+    <button id="pluck" style="margin-top:12px">Record 12s · single plucks</button>
+    <div id="p4"></div>
+  </div>`));
+  document.getElementById('pluck').onclick = () => recordTexture('pluck');
+}
+async function recordTexture(kind) {
+  const frames=[]; const btn=document.getElementById(kind==='pluck'?'pluck':'strum'); btn.disabled=true;
+  const live=document.getElementById('live'), mtr=document.getElementById('mtr');
+  onMsg=(f)=>{ tapRms(f); if(f.rms>0.02) frames.push(f); mtr.style.width=Math.min(100,f.rms*400)+'%';
+    if(f.hz>0) live.innerHTML=`clarity <b>${fx(f.clarity,2)}</b> · peaks ${f.peaks} · zcr ${fx(f.zcr,3)}`; };
+  for(let t=12;t>0;t--){ btn.textContent=`recording ${kind}… ${t}s`; await sleep(1000); }
+  onMsg=tapRms; btn.disabled=false; btn.textContent='done';
+  const strong = frames.filter(f=>f.rms>0.02);
+  const agg = { n: strong.length, clarityMed: median(strong.map(f=>f.clarity)),
+    clarityP25: pct(strong.map(f=>f.clarity),25), clarityP75: pct(strong.map(f=>f.clarity),75),
+    peaksMed: median(strong.map(f=>f.peaks)) };
+  if(kind==='pluck'){
+    RESULT.pluck=agg;
+    document.getElementById('p4').innerHTML = `
+      <div class="rows" style="margin-top:12px">
+        <div><span class="k">pluck clarity (25/50/75)</span><span class="mono">${fx(agg.clarityP25,2)} / ${fx(agg.clarityMed,2)} / ${fx(agg.clarityP75,2)}</span></div>
+        <div><span class="k">pluck peaks (median)</span><span class="mono">${fx(agg.peaksMed,0)}</span></div></div>
+      <button id="strum" style="margin-top:12px">Now record 12s · strum all six</button><div id="p4b"></div>`;
+    document.getElementById('strum').onclick=()=>recordTexture('strum');
+  } else {
+    RESULT.strum=agg;
+    const p=RESULT.pluck, s=agg; let verdict='—';
+    if(p&&s){
+      const gap = p.clarityP25 - s.clarityP75;
+      if (gap > 0.05) verdict='SEPARABLE (pluck clarity clears strum)';
+      else if (p.clarityMed - s.clarityMed > 0.05) verdict='MARGINAL (medians differ, quartiles overlap)';
+      else verdict='NOT separable on clarity alone';
+    }
+    RESULT.separability=verdict;
+    const vCls = verdict.startsWith('SEPAR')?'good':verdict.startsWith('MARG')?'warn':'bad';
+    document.getElementById('p4b').innerHTML = `
+      <div class="rows" style="margin-top:12px">
+        <div><span class="k">strum clarity (25/50/75)</span><span class="mono">${fx(s.clarityP25,2)} / ${fx(s.clarityMed,2)} / ${fx(s.clarityP75,2)}</span></div>
+        <div><span class="k">strum peaks (median)</span><span class="mono">${fx(s.peaksMed,0)}</span></div></div>
+      <div class="big ${vCls}" style="margin-top:10px;font-size:18px">${verdict}</div>
+      <button id="fin" style="margin-top:12px">Next · frame budget</button>`;
+    document.getElementById('p4b').querySelector('#fin').onclick=s5;
+  }
+}
+
+// ════════════════════ STATION 5 — frame budget: shipped vs worklet ════════════════════
+// Same heavy canvas animation both passes. Pass A also runs the shipped 130ms main-thread
+// poll (AnalyserNode read + analyze on the main thread). Pass B leaves detection to the
+// worklet (audio thread). The worklet holding 60fps where the shipped path janks is the
+// rewrite argument on its own — independent of accuracy.
+function s5() {
+  screen(h(`<div class="card center">
+    <div class="step">Station 5 · frame budget</div>
+    <h2>Shipped poll vs worklet</h2>
+    <p>Two ~3s passes of the same heavy animation. Hold still; keep playing lightly so there's signal to detect.</p>
+    <canvas id="cv" width="440" height="130"></canvas>
+    <button id="run">Run both passes</button>
+    <div id="fbd"></div>
+  </div>`));
+  document.getElementById('run').onclick = runFrameBudget;
+}
+function animatePass(durationMs, onFrameExtra) {
+  return new Promise((resolve)=>{
+    const cv=document.getElementById('cv'), g=cv.getContext('2d');
+    const raf=[]; let last=performance.now(); let n=0; const start=last;
+    const dots=Array.from({length:60},(_,i)=>({x:Math.random()*440,y:Math.random()*130,vx:(Math.random()-.5)*6,vy:(Math.random()-.5)*6}));
+    function frame(now){
+      const dt=now-last; last=now; if(n>3) raf.push(dt); n++;
+      g.clearRect(0,0,440,130);
+      for(const d of dots){ d.x=(d.x+d.vx+440)%440; d.y=(d.y+d.vy+130)%130;
+        g.beginPath(); g.arc(d.x,d.y,7,0,7); g.fillStyle='#C99B58'; g.fill(); }
+      if(onFrameExtra) onFrameExtra();
+      if(now-start<durationMs) requestAnimationFrame(frame); else resolve(raf);
+    }
+    requestAnimationFrame(frame);
+  });
+}
+async function runFrameBudget() {
+  const btn=document.getElementById('run'); btn.disabled=true;
+  // ── Pass A: shipped path (main-thread 130ms poll running detection) ──
+  btn.textContent='pass A · shipped 130ms poll…';
+  const detectMs=[]; let lastPoll=0;
+  const poll=setInterval(()=>{
+    analyser.getFloatTimeDomainData(anaBuf);
+    const t0=performance.now(); analyze(anaBuf, ctx.sampleRate); detectMs.push(performance.now()-t0);
+  }, POLL_MS);
+  const rafA=await animatePass(3000);
+  clearInterval(poll);
+  RESULT.shipped.detectWorst = detectMs.length?Math.max(...detectMs):null;
+  RESULT.shipped.rafWorst = rafA.length?Math.max(...rafA):null;
+  RESULT.shipped.rafP95 = pct(rafA,95);
+  await sleep(400);
+  // ── Pass B: worklet path (detection on the audio thread; main thread only animates) ──
+  btn.textContent='pass B · worklet…';
+  const mark=allFrames.length;
+  const rafB=await animatePass(3000);
+  const procs=allFrames.slice(mark).filter(f=>f.procMs>=0).map(f=>f.procMs);
+  RESULT.worklet.procWorst = procs.length?Math.max(...procs):null;
+  RESULT.worklet.procMedian = median(procs);
+  RESULT.worklet.rafWorst = rafB.length?Math.max(...rafB):null;
+  RESULT.worklet.rafP95 = pct(rafB,95);
+  btn.disabled=false; btn.textContent='done';
+
+  const quantumMs = 128/ctx.sampleRate*1000;
+  const workletHopMs = HOP/ctx.sampleRate*1000;
+  const jankA=RESULT.shipped.rafWorst, jankB=RESULT.worklet.rafWorst;
+  const argCls = (jankB!=null&&jankA!=null&&jankB<20&&jankA>=jankB*1.4)?'good':'';
+  const wProc = RESULT.worklet.procWorst!=null ? fx(RESULT.worklet.procWorst,3)+' ms'
+              : '~'+fx(RESULT.shipped.detectWorst,2)+' ms*';
+  const procNote = RESULT.worklet.procWorst!=null ? ''
+    : '<div class="hint" style="margin-top:6px">* this browser\'s worklet scope has no <code>performance.now</code>, so process() self-timing is unavailable. Detection is the <b>same</b> analyze() as the shipped column — same cost per call — just run on the audio thread, which is why the worst-main-thread-frame row is the real comparison.</div>';
+  document.getElementById('fbd').innerHTML = `
+    <table class="cmp">
+      <tr><th>metric</th><th>shipped (130ms poll)</th><th>worklet</th></tr>
+      <tr><td>worst detect / process()</td><td>${fx(RESULT.shipped.detectWorst,2)} ms</td><td>${wProc}</td></tr>
+      <tr><td>worst main-thread frame</td><td class="${jankA>=40?'bad':jankA>=20?'warn':''}">${fx(jankA,1)} ms</td><td class="${jankB>=40?'bad':jankB>=20?'warn':'good'}">${fx(jankB,1)} ms</td></tr>
+      <tr><td>timing resolution (poll)</td><td>${POLL_MS} ms</td><td>${fx(workletHopMs,1)} ms</td></tr>
+    </table>
+    ${procNote}
+    <div class="hint" style="margin-top:8px">60fps = 16.7ms/frame; worklet detect deadline = ${fx(quantumMs,2)}ms/quantum. ${argCls?'<b class="good">Worklet holds where the shipped poll janks — a rewrite argument on its own.</b>':'Compare the worst-main-thread-frame row.'}</div>
+    <div class="hint" style="margin-top:6px"><b>Answerable on paper (confirmed here):</b> the 130ms poll caps mic timing resolution at ~130ms. At 120bpm an eighth note is 250ms — that is ~half-an-eighth-note granularity on every "in time" judgment (walk found-it, hunt, right-note-right-time). The worklet's ${fx(workletHopMs,1)}ms hop is the fix.</div>
+    <button id="see" style="margin-top:12px">Next · touch drill</button>`;
+  document.getElementById('see').onclick=s6;
+}
+
+// ════════════════════ STATION 6 — touch → click (Pulse tap-drill floor) ════════════════════
+// The 92.7ms latency is speaker→air→mic. Pulse's tap drill is touch→click, a different
+// chain entirely. This measures the jitter of THAT chain — taps vs a Web-Audio metronome —
+// which is the real floor on any placement window (±20/±35ms rested on the wrong number).
+function s6() {
+  screen(h(`<div class="card center">
+    <div class="step">Station 6 · touch → click</div>
+    <h2>Tap-drill timing floor</h2>
+    <p>A metronome plays; <b>tap the pad on each click</b>, ~16 taps. We measure how tightly your taps land vs the beat — the floor for any placement window. No speaker→mic loop here, so it works even if audio is faint (use headphones if you can't hear the click).</p>
+    <div id="tpad" style="height:150px;background:#E0AC5E;border-radius:16px;display:flex;align-items:center;justify-content:center;font-weight:800;color:#33271C;font-size:18px;user-select:none;touch-action:manipulation;cursor:pointer">tap here</div>
+    <div class="live" id="tlive" style="margin-top:8px">tap 0 / 16</div>
+    <button id="tstart" style="margin-top:12px">Start metronome</button>
+    <div id="t6done"></div>
+  </div>`));
+  document.getElementById('tstart').onclick = runTouch;
+}
+async function runTouch() {
+  const btn = document.getElementById('tstart'); btn.disabled = true; btn.textContent = 'listen & tap…';
+  const BPM = 100, period = 60/BPM, N = 16;
+  const t0ctx = ctx.currentTime + 0.6, t0perf = performance.now() + 600; // aligned start
+  const clickPerf = [];
+  for (let k=0;k<=N;k++){
+    const tc = t0ctx + k*period;
+    clickPerf.push(t0perf + k*period*1000);
+    const buf = ctx.createBuffer(1, Math.floor(ctx.sampleRate*0.03), ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i=0;i<d.length;i++){ const t=i/ctx.sampleRate; d[i]=Math.sin(2*Math.PI*1500*t)*Math.min(1,(0.03-t)/0.005)*0.9; }
+    const s=ctx.createBufferSource(); s.buffer=buf; s.connect(ctx.destination); s.start(tc);
+  }
+  const taps = [], handlerDelays = [];
+  const pad = document.getElementById('tpad'), live = document.getElementById('tlive');
+  const onTap = (e) => {
+    e.preventDefault();
+    const tEvt = (e.timeStamp && e.timeStamp < 1e12) ? e.timeStamp : performance.now();
+    handlerDelays.push(performance.now() - tEvt);
+    taps.push(tEvt);
+    pad.style.background = '#C99B58'; setTimeout(()=>{ if(pad) pad.style.background='#E0AC5E'; }, 80);
+    live.textContent = `tap ${taps.length} / ${N}`;
+  };
+  pad.addEventListener('touchstart', onTap, {passive:false});
+  pad.addEventListener('mousedown', onTap);
+  await sleep((0.6 + (N+1)*period)*1000 + 500);
+  pad.removeEventListener('touchstart', onTap); pad.removeEventListener('mousedown', onTap);
+  btn.disabled=false; btn.textContent='done';
+
+  const offsets = taps.map(t => { let best=Infinity; for(const c of clickPerf){ const dd=t-c; if(Math.abs(dd)<Math.abs(best)) best=dd; } return best; });
+  const sd = (a)=>{ if(a.length<2) return NaN; const m=a.reduce((x,y)=>x+y,0)/a.length; return Math.sqrt(a.reduce((s,x)=>s+(x-m)*(x-m),0)/(a.length-1)); };
+  RESULT.touch = { taps: taps.length, offsetMedian: median(offsets), offsetSD: sd(offsets),
+    handlerDelayMedian: median(handlerDelays), handlerDelaySD: sd(handlerDelays) };
+  const T = RESULT.touch;
+  const cls = T.offsetSD < 20 ? 'good' : T.offsetSD < 35 ? 'warn' : 'bad';
+  document.getElementById('t6done').innerHTML = `
+    <div class="rows" style="margin-top:12px">
+      <div><span class="k">taps captured</span><span class="mono">${T.taps}/${N}</span></div>
+      <div><span class="k">tap offset (median / SD)</span><span class="mono ${cls}">${fx(T.offsetMedian,0)} / ${fx(T.offsetSD,0)} ms</span></div>
+      <div><span class="k">event→handler delay (med / SD)</span><span class="mono">${fx(T.handlerDelayMedian,1)} / ${fx(T.handlerDelaySD,1)} ms</span></div>
+    </div>
+    <div class="hint" style="margin-top:8px">Offset SD is the tap-jitter floor (human + touch chain, no speaker). A placement band tighter than this SD flags an on-time tap as off. So ±20 ms is ${T.offsetSD>20?'<b class="bad">inside the noise</b>':'<b class="good">clear of</b>'} the jitter and ±35 ms is ${T.offsetSD>35?'<b class="bad">inside</b>':'<b class="good">clear of</b>'} it. event→handler SD isolates the pure chain (no human).</div>
+    <button id="see2" style="margin-top:12px">See all results</button>`;
+  document.getElementById('t6done').querySelector('#see2').onclick = results;
+}
+
+// ════════════════════ RESULTS ════════════════════
+function results() {
+  const R=RESULT;
+  const T=R.touch;
+  const quantumMs = 128/R.sampleRate*1000, workletHopMs = HOP/R.sampleRate*1000;
+  const rHi = R.rmsResolved.length? pct(R.rmsResolved,5):NaN;
+  const uHi = R.rmsUnresolved.length? pct(R.rmsUnresolved,95):NaN;
+  const lat = R.loopbackMeasured ? `${fx(R.loopbackMedian,1)} ms acoustic round-trip (${R.loopbackMs.length}/8) [${R.loopbackMs.map(x=>fx(x,0)).join(', ')}]`
+                                 : `NOT MEASURED — only ${R.loopbackMs.length}/8 clicks caught. (self-report base/output ${fx(R.baseLatencyMs,1)}/${fx(R.outputLatencyMs,1)}ms is NOT the answer)`;
+  const summary =
+`AUDIOWORKLET PITCH SPIKE — ${new Date().toISOString().slice(0,16).replace('T',' ')}
+device: ${(R.device||'').slice(0,90)}
+sampleRate: ${R.sampleRate}  quantum: ${fx(quantumMs,2)}ms  workletHop: ${fx(workletHopMs,1)}ms  workletPerf: ${R.worklet.perfAvail}
+
+1) LATENCY (acoustic round-trip, speaker->air->mic)
+   ${lat}
+
+2) ACCURACY (the two that fail)
+   low E (82.41Hz): resolved ${fx((R.lowE?.resolvedRate||0)*100,0)}% · onTarget ${fx((R.lowE?.onTargetPct||0)*100,0)}% · octaveErr ${fx(((R.lowE?.octaveUpPct||0)+(R.lowE?.octaveDownPct||0))*100,0)}% · cents med/p95 ${fx(R.lowE?.centsMedian,0)}/${fx(R.lowE?.centsP95,0)}
+   B     (246.9Hz): resolved ${fx((R.bStr?.resolvedRate||0)*100,0)}% · onTarget ${fx((R.bStr?.onTargetPct||0)*100,0)}% · octaveErr ${fx(((R.bStr?.octaveUpPct||0)+(R.bStr?.octaveDownPct||0))*100,0)}% · cents med/p95 ${fx(R.bStr?.centsMedian,0)}/${fx(R.bStr?.centsP95,0)}
+
+3) FRAME BUDGET (shipped 130ms main-poll  vs  worklet)   [60fps=16.7ms; deadline ${fx(quantumMs,2)}ms/quantum]
+   worst detect/process:   shipped ${fx(R.shipped.detectWorst,2)}ms   |   worklet ${R.worklet.procWorst!=null?fx(R.worklet.procWorst,3)+'ms':'~'+fx(R.shipped.detectWorst,2)+'ms (same analyze off-thread; no worklet perf timer)'}
+   worst main-thread frame: shipped ${fx(R.shipped.rafWorst,1)}ms   |   worklet ${fx(R.worklet.rafWorst,1)}ms
+   timing resolution:       shipped ${POLL_MS}ms poll  |  worklet ${fx(workletHopMs,1)}ms hop   (130ms ~= half an 8th note @120bpm)
+
+4) PLUCK vs STRUM (autocorrelation clarity)
+   pluck 25/50/75: ${fx(R.pluck?.clarityP25,2)}/${fx(R.pluck?.clarityMed,2)}/${fx(R.pluck?.clarityP75,2)}
+   strum 25/50/75: ${fx(R.strum?.clarityP25,2)}/${fx(R.strum?.clarityMed,2)}/${fx(R.strum?.clarityP75,2)}
+   verdict: ${R.separability}
+
+5) RMS GATE (resolved vs unresolved) — feeds the RMS conflict
+   resolved:   min ${fx(Math.min(...(R.rmsResolved.length?R.rmsResolved:[0])),4)} · p5 ${fx(rHi,4)} · med ${fx(median(R.rmsResolved),4)}  (n=${R.rmsResolved.length})
+   unresolved: p95 ${fx(uHi,4)} · med ${fx(median(R.rmsUnresolved),4)}  (n=${R.rmsUnresolved.length})
+   -> gate belongs between unresolved-p95 (${fx(uHi,4)}) and resolved-p5 (${fx(rHi,4)}). Current code: 0.002.
+
+6) TOUCH -> CLICK (Pulse tap-drill floor; NOT the 92.7ms acoustic chain)
+   tap offset: median ${fx(T?.offsetMedian,0)}ms  SD ${fx(T?.offsetSD,0)}ms   (SD = placement-window floor; ${T?`${T.taps}`:'0'} taps)
+   event->handler delay: median ${fx(T?.handlerDelayMedian,1)}ms  SD ${fx(T?.handlerDelaySD,1)}ms
+   -> +/-20ms band is ${T && T.offsetSD>20?'INSIDE':'clear of'} the tap jitter; +/-35ms is ${T && T.offsetSD>35?'INSIDE':'clear of'} it.`;
+
+  const latCls = R.loopbackMeasured ? (R.loopbackMedian<80?'good':R.loopbackMedian<160?'warn':'bad') : 'bad';
+  screen(h(`<div>
+    <div class="card">
+      <div class="step">Station 5 · results</div>
+      <h2>Read these back to Claude Code</h2>
+      <div class="rows">
+        <div><span class="k">1 · latency (acoustic)</span><span class="mono ${latCls}">${R.loopbackMeasured?fx(R.loopbackMedian,1)+' ms':'NOT MEASURED'}</span></div>
+        <div><span class="k">2 · low E resolved / octaveErr</span><span class="mono">${fx((R.lowE?.resolvedRate||0)*100,0)}% / ${fx(((R.lowE?.octaveUpPct||0)+(R.lowE?.octaveDownPct||0))*100,0)}%</span></div>
+        <div><span class="k">2 · B resolved / octaveErr</span><span class="mono">${fx((R.bStr?.resolvedRate||0)*100,0)}% / ${fx(((R.bStr?.octaveUpPct||0)+(R.bStr?.octaveDownPct||0))*100,0)}%</span></div>
+        <div><span class="k">3 · main frame: shipped vs worklet</span><span class="mono">${fx(R.shipped.rafWorst,1)} / ${fx(R.worklet.rafWorst,1)} ms</span></div>
+        <div><span class="k">4 · pluck vs strum</span><span class="mono">${R.separability.split(' ')[0]}</span></div>
+        <div><span class="k">5 · gate window</span><span class="mono">${fx(uHi,4)}–${fx(rHi,4)}</span></div>
+        <div><span class="k">6 · tap offset SD (drill floor)</span><span class="mono">${T?fx(T.offsetSD,0)+' ms':'—'}</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="step">copy / screenshot this</div>
+      <pre class="out" id="raw">${summary.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}</pre>
+      <button class="ghost" id="copy">Copy the raw block</button>
+      <button class="ghost" id="again" style="margin-top:8px">Run it again</button>
+    </div>
+  </div>`));
+  document.getElementById('copy').onclick = () => navigator.clipboard?.writeText(summary).then(()=>{document.getElementById('copy').textContent='copied ✓';},()=>{});
+  document.getElementById('again').onclick = () => { RESULT.loopbackMs=[]; RESULT.loopbackMeasured=false; RESULT.rmsResolved=[]; RESULT.rmsUnresolved=[]; allFrames.length=0; s1(); };
+}
+
+s0();
+</script>
+</body>
+</html>
