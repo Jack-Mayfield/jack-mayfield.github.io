@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NAM render spike</title>
+<style>
+  body { font-family: ui-monospace, Menlo, monospace; background: #F4F1E8; color: #35291F; margin: 0; padding: 18px; font-size: 13px; }
+  h1 { font-size: 14px; letter-spacing: .12em; text-transform: uppercase; }
+  button { font: inherit; font-weight: 700; padding: 12px 16px; border-radius: 12px; border: 1px solid #C2BAA8; background: #E0AC5E; color: #35291F; margin: 6px 6px 6px 0; }
+  #log { white-space: pre-wrap; background: #EDE8DA; border: 1px solid #C2BAA8; border-radius: 12px; padding: 12px; margin-top: 12px; user-select: all; -webkit-user-select: all; }
+</style>
+</head>
+<body>
+<h1>NAM render spike — V3</h1>
+<p>Read every line back to the session. Numbers, not impressions.</p>
+<button id="init">1 · NAM init + setDsp</button>
+<button id="ir">2 · Offline IR render</button>
+<div id="log"></div>
+<script>
+const log = (line) => { document.getElementById('log').textContent += line + '\n' }
+
+// --- COI bootstrap: register the scoped SW, reload once so it controls us ---
+;(async () => {
+  log(`ua: ${navigator.userAgent}`)
+  if (!('serviceWorker' in navigator)) { log('coi: NO service worker support'); return }
+  const reg = await navigator.serviceWorker.register('coi-sw.js', { scope: './' })
+  await navigator.serviceWorker.ready
+  if (!navigator.serviceWorker.controller && !sessionStorage.getItem('coi-reloaded')) {
+    sessionStorage.setItem('coi-reloaded', '1')
+    log('coi: first visit — reloading under the SW…')
+    location.reload()
+    return
+  }
+  log(`coi: controlled=${!!navigator.serviceWorker.controller} crossOriginIsolated=${self.crossOriginIsolated}`)
+  log(`sab: constructor=${typeof SharedArrayBuffer !== 'undefined'}`)
+  try {
+    const m = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true })
+    log(`sab: shared WebAssembly.Memory OK (${m.buffer.constructor.name})`)
+  } catch (e) {
+    log(`sab: shared WebAssembly.Memory FAILED — ${e.message}`)
+  }
+})()
+
+// --- 1: instantiate the TONE3000 module, load a .nam via setDsp ---
+document.getElementById('init').onclick = async () => {
+  const t0 = performance.now()
+  try {
+    window.Module = {
+      mainScriptUrlOrBlob: 't3k-wasm-module.js',
+      locateFile: (f) => f,
+      onRuntimeInitialized: async () => {
+        log(`nam: runtime initialized in ${(performance.now() - t0).toFixed(0)} ms`)
+        try {
+          const json = await (await fetch('deluxe.nam')).text()
+          const t1 = performance.now()
+          const len = Module.lengthBytesUTF8 ? Module.lengthBytesUTF8(json) + 1 : json.length * 4 + 1
+          const ptr = Module._malloc(len)
+          Module.stringToUTF8(json, ptr, len)
+          const call = Module.ccall('setDsp', null, ['number', 'number'], [ptr, 0], { async: true })
+          await Promise.race([call, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout 20s')), 20000))])
+          log(`nam: setDsp(deluxe.nam ${(json.length / 1024).toFixed(0)}KB) OK in ${(performance.now() - t1).toFixed(0)} ms`)
+        } catch (e) { log(`nam: setDsp FAILED — ${e.message}`) }
+      },
+    }
+    const s = document.createElement('script')
+    s.src = 't3k-wasm-module.js'
+    s.onerror = () => log('nam: glue script failed to load')
+    document.body.appendChild(s)
+    setTimeout(() => { if (!Module.calledRun) log(`nam: runtime NOT initialized after 20s (calledRun=${!!Module.calledRun})`) }, 20000)
+  } catch (e) { log(`nam: init FAILED — ${e.message}`) }
+}
+
+// --- 2: the IR half of the chain, fully measurable today ---
+document.getElementById('ir').onclick = async () => {
+  try {
+    const secs = 10
+    const t0 = performance.now()
+    const octx = new OfflineAudioContext({ numberOfChannels: 1, length: 48000 * secs, sampleRate: 48000 })
+    log(`ir: OfflineAudioContext 48k OK (device rate would be ${new AudioContext().sampleRate})`)
+    const irBytes = await (await fetch('celestion.wav')).arrayBuffer()
+    const ir = await octx.decodeAudioData(irBytes)
+    log(`ir: decoded celestion.wav ${ir.duration.toFixed(2)}s @ ${ir.sampleRate}`)
+    const noise = octx.createBuffer(1, 48000 * secs, 48000)
+    const d = noise.getChannelData(0)
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / 48000)
+    const src = octx.createBufferSource(); src.buffer = noise
+    const conv = octx.createConvolver(); conv.buffer = ir
+    src.connect(conv); conv.connect(octx.destination); src.start()
+    const t1 = performance.now()
+    const out = await octx.startRendering()
+    const ms = performance.now() - t1
+    let peak = 0
+    const o = out.getChannelData(0)
+    for (let i = 0; i < o.length; i++) peak = Math.max(peak, Math.abs(o[i]))
+    log(`ir: rendered ${secs}s in ${ms.toFixed(0)} ms (RTF ${(ms / (secs * 1000)).toFixed(3)}) peak=${peak.toFixed(3)} total=${(performance.now() - t0).toFixed(0)} ms`)
+  } catch (e) { log(`ir: FAILED — ${e.message}`) }
+}
+</script>
+</body>
+</html>
